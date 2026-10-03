@@ -1,0 +1,103 @@
+name: Process WhatsApp Shorts
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: whatsapp-shorts
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.8.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Restore encrypted WhatsApp state
+        uses: actions/cache@v4
+        with:
+          path: runner-state
+          key: whatsapp-state-${{ github.run_id }}
+          restore-keys: |
+            whatsapp-state-
+
+      - name: Install dependencies and tools
+        run: |
+          pnpm install --frozen-lockfile
+          pipx install yt-dlp
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if ! command -v ffmpeg >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y ffmpeg
+          fi
+
+      - name: Restore WhatsApp login and message ledger
+        env:
+          WHATSAPP_INITIAL_STATE_B64: ${{ secrets.WHATSAPP_INITIAL_STATE_B64 }}
+          WHATSAPP_STATE_PASSPHRASE: ${{ secrets.WHATSAPP_STATE_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$WHATSAPP_STATE_PASSPHRASE" ]]; then
+            echo "Missing WHATSAPP_STATE_PASSPHRASE secret."
+            exit 1
+          fi
+          if [[ -f runner-state/state.tar.gz.gpg ]]; then
+            encrypted_state=runner-state/state.tar.gz.gpg
+          else
+            if [[ -z "$WHATSAPP_INITIAL_STATE_B64" ]]; then
+              echo "Pair WhatsApp locally and configure WHATSAPP_INITIAL_STATE_B64 first."
+              exit 1
+            fi
+            printf '%s' "$WHATSAPP_INITIAL_STATE_B64" | base64 --decode > "$RUNNER_TEMP/initial-state.gpg"
+            encrypted_state="$RUNNER_TEMP/initial-state.gpg"
+          fi
+          gpg --batch --quiet --pinentry-mode loopback \
+            --passphrase "$WHATSAPP_STATE_PASSPHRASE" \
+            --decrypt "$encrypted_state" | tar -xzf -
+
+      - name: Listen for and process recent Shorts links
+        env:
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        run: |
+          set +e
+          timeout --signal=TERM 55s pnpm start
+          status=$?
+          set -e
+          if [[ $status -ne 0 && $status -ne 124 && $status -ne 143 ]]; then
+            exit "$status"
+          fi
+
+      - name: Save encrypted WhatsApp state
+        if: always()
+        env:
+          WHATSAPP_STATE_PASSPHRASE: ${{ secrets.WHATSAPP_STATE_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [[ -d auth_info_baileys ]]; then
+            mkdir -p data
+            mkdir -p runner-state
+            tar -czf "$RUNNER_TEMP/whatsapp-state.tar.gz" auth_info_baileys data
+            gpg --batch --yes --quiet --pinentry-mode loopback \
+              --passphrase "$WHATSAPP_STATE_PASSPHRASE" \
+              --symmetric --cipher-algo AES256 \
+              --output runner-state/state.tar.gz.gpg \
+              "$RUNNER_TEMP/whatsapp-state.tar.gz"
+          fi
